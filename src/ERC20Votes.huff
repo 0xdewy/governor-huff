@@ -1,0 +1,980 @@
+/// @title ERC20Votes
+/// @notice Huff implementation of Governer Bravo
+/// @author Kyle Dewhurst https://github.com/kyledewy
+/// @author ERC20 adapted from: https://github.com/devtooligan/huffhuffpass
+/// @author Solidity implementation: https://github.com/compound-finance/compound-protocol
+
+
+/* Imports */
+#include "utils/HashMap.huff"
+
+/* Interface */
+#define function allowance(address,address) view returns (uint256)
+#define function approve(address,uint256) nonpayable returns () // these returns sb updated
+#define function balanceOf(address) view returns (uint256)
+#define function burn(address,uint256) nonpayable returns ()
+#define function decimals() nonpayable returns (uint256)
+#define function DOMAIN_SEPARATOR() view returns (bytes32)
+#define function mint(address,uint256) nonpayable returns ()
+#define function name() nonpayable returns (string)
+#define function nonces(address) view returns (uint256)
+#define function permit(address,address,uint256,uint256,uint8,bytes32,bytes32) nonpayable returns ()
+#define function symbol() nonpayable returns (string)
+#define function totalSupply() view returns (uint256)
+#define function transfer(address,uint256) nonpayable returns ()
+#define function transferFrom(address,address,uint256) nonpayable returns ()
+
+#define function getCurrentVotes(address) view returns (uint96)
+#define function getPriorVotes(address, uint) view returns (uint96)
+#define function delegates(address) view returns (address)
+#define function checkpoints(address, uint32) view returns (bytes32)
+#define function numCheckpoints(address) view returns (uint32)
+#define function checkpointVotes(address, uint32) view returns (uint96)
+#define function checkpointBlock(address, uint32) view returns (uint32)
+#define function delegate(address) nonpayable returns ()
+
+/* Events */
+#define event Approval(address indexed, address indexed, uint)
+#define event Transfer(address indexed, address indexed, uint)
+#define event DelegateVotesChanged(address indexed,uint,uint)
+#define event DelegateChanged(address indexed, address indexed, address indexed)
+
+
+/* Storage Slots */
+#define constant APPROVAL_SLOT = FREE_STORAGE_POINTER()
+#define constant BALANCE_SLOT = FREE_STORAGE_POINTER()
+#define constant CHECKPOINTS_SLOT = FREE_STORAGE_POINTER()
+#define constant NUM_CHECKPOINT_SLOT = FREE_STORAGE_POINTER()
+#define constant INITIAL_CHAIN_ID = FREE_STORAGE_POINTER()
+#define constant INITIAL_DOMAIN_SEPARATOR = FREE_STORAGE_POINTER()
+#define constant NONCE_SLOT = FREE_STORAGE_POINTER()
+#define constant DELEGATES_SLOT = FREE_STORAGE_POINTER()
+
+/* Constants */
+#define constant PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9 // keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)")
+#define constant UINT_256_MAX = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+#define constant UINT_96_MAX = 0x0000000000000000000000000000000000000000ffffffffffffffffffffffff
+#define constant UINT_32_MAX = 0x00000000000000000000000000000000000000000000000000000000ffffffff
+#define constant X_1901 = 0x1901000000000000000000000000000000000000000000000000000000000000
+
+/* Custom Errors */
+#define error PermitExpired()
+#define error InvalidSigner()
+#define error InsufficientFunds()
+#define error InsufficientAllowance()
+#define error Safe96Overflow()
+#define error VoteOverflow()
+#define error VoteUnderflow()
+#define error BlockNumberOverflow()
+#define error SentToZeroAddress()
+#define error BlockDoesntExist()
+
+#define macro EMIT_DELEGATE_VOTES_CHANGED() = takes (3) returns (0) {
+    // InitialStack: [oldVotes, newVotes, delegatee]
+    0x00 mstore                                                   // [newVotes, delegatee]
+    0x20 mstore                                                   // [delegatee] 
+    __EVENT_HASH(DelegateVotesChanged)                            // [sig, delegatee]
+    0x40 0x00 log2                                                          // []
+}
+
+// InitialStack: [delegator, currentDelegatee, delegatee]
+#define macro EMIT_DELEGATE_CHANGED() = takes(3) returns (0) {
+    __EVENT_HASH(DelegateChanged)
+    0x00 0x00 log4                   // []
+}
+
+#define macro EMIT_APPROVAL() = takes(3) returns (0) {
+    // InitialStack: [from, to, value]
+    swap2 0x00 mstore                                           // [to, from]
+    swap1
+    __EVENT_HASH(Approval)
+    0x20 0x00 log3
+}
+
+#define macro EMIT_TRANSFER() = takes(3) returns (0) {
+    // Initial stack: [value, from, to]
+    0x00 mstore                                                                // [from, to]
+    __EVENT_HASH(Transfer)                                                     // [sig, from, to]
+    0x20 0x00 log3                                                             // []
+}
+
+/* Constructor */
+#define macro CONSTRUCTOR() = takes(0) returns (0) {
+    chainid [INITIAL_CHAIN_ID] sstore                                          // []
+    COMPUTE_DOMAIN_SEPARATOR()                                                 // [DOMAIN SEPARATOR]
+    [INITIAL_DOMAIN_SEPARATOR] sstore                                          // []
+    _TOTAL_SUPPLY() caller                                                     // [msg.sender, supply]
+    [BALANCE_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                      // []
+}
+
+#define macro REVERT() = takes (1) returns (0) {
+    // InitialState: [error_selector]
+    // __ERROR(InsufficientAllowance)
+    0x00 mstore           // []
+    0x04 0x1C revert
+}
+
+#define macro _RETURN_SINGLE() = takes(1) returns (0) {
+    0x00 mstore
+    0x20 0x00 return
+}
+
+// Revert if number is > uint96.max
+#define macro SAFE_96() = takes (1) returns (1) {
+    // Initial stack:    // [value]
+    dup1 [UINT_96_MAX] lt iszero finish jumpi
+        0x4148031a   // Safe96Overflow()
+        REVERT()
+
+    finish:
+}
+
+// Revert if number is > uint32.max
+#define macro SAFE_32() = takes (1) returns (1) {
+    // Initial stack:   // [value]
+    dup1 [UINT_32_MAX] lt iszero finish jumpi
+        // __ERROR(BlockNumberOverflow)
+        0xfaca99b4
+        REVERT()
+
+    finish:
+}
+
+#define macro SUB_1() = takes (1) returns (1) {
+                                            // [a]
+    [UINT_256_MAX] add                      // [a - 1]
+}
+
+#define macro MASK_ADDRESS() = takes(1) returns (1) {
+    0x000000000000000000000000ffffffffffffffffffffffffffffffffffffffff
+	and
+}
+
+#define macro DELEGATES() = takes(0) returns(0) {
+    0x04 calldataload MASK_ADDRESS()                       // [delegator]
+    [DELEGATES_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)
+    0x00 mstore
+    0x20 0x00 return
+}
+
+#define macro CHECKPOINT_VOTES() = takes(0) returns(0) {
+    0x24 calldataload                                   // [nCheckpoints ]
+    0x04 calldataload MASK_ADDRESS()                    // [addr, nCheckpoints]
+    [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)
+    _UNPACK_CHECKPOINT_VOTES()
+    0x00 mstore
+    0x20 0x00 return
+}
+#define macro CHECKPOINT_BLOCK() = takes(0) returns(0) {
+    0x24 calldataload                                   // [nCheckpoints ]
+    0x04 calldataload MASK_ADDRESS()                    // [addr, nCheckpoints]
+    [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)
+    _UNPACK_CHECKPOINT_BLOCK()
+    0x00 mstore
+    0x20 0x00 return
+}
+
+#define macro CHECKPOINTS() = takes(0) returns(0) {
+    0x24 calldataload                                   // [nCheckpoints ]
+    0x04 calldataload MASK_ADDRESS()                    // [addr, nCheckpoints]
+    [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)
+    0x00 mstore
+    0x20 0x00 return
+}
+
+#define macro NUM_CHECKPOINTS() = takes(0) returns(0) {
+    0x04 calldataload MASK_ADDRESS()                   // [addr]
+    [NUM_CHECKPOINT_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)
+    0x00 mstore
+    0x20 0x00 return
+}
+
+// Manually packed into single storage slot
+// Checkpoint Storage: [0x000000000000VotingAmount00000000000000000000000000000000x000block]
+//                     [---------12bytes---------][------------16bytes-----------][-4bytes-]
+//                      0xFFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000FFFFFFFF
+#define macro _PACK_CHECKPOINT() = takes (2) returns (1) {
+    // InputStack:   [votes, fromBlock]
+    0xA0 shl                                                                   // [votes << 160, fromBlock]
+    or                                                                         // [packedCheckpoint]
+}
+
+#define macro _PACK_CHECKPOINT_VOTES() = takes (2) returns (1) {
+    // InputStack: [packedCheckpoint, newVotes]
+    _UNPACK_CHECKPOINT_BLOCK() swap1                                         // [fromBlock, newVotes]
+    _PACK_CHECKPOINT()                                                      // [packedCheckpoint]
+}
+
+#define macro _UNPACK_CHECKPOINT() = takes (1) returns (2) {
+    // InputStack:  [packedCheckpoint]
+    dup1 [UINT_32_MAX] and // [fromBlock, packedCheckpoint]
+    swap1 0xA0 shr                                                           // [votes, fromBlock] 
+}
+
+#define macro _UNPACK_CHECKPOINT_VOTES() = takes (1) returns (1) {
+    // InputStack: [packedCheckpoint]
+    0xA0 shr                                                                // [checkpoint.votes]
+}
+
+#define macro _UNPACK_CHECKPOINT_BLOCK() = takes (1) returns (1) {
+    // InputStack: [packedCheckpoint]
+    [UINT_32_MAX] and                                                     // [checkpoint.fromBlock]
+}
+
+#define macro _WRITE_CHECKPOINT() = takes(4) returns(0) {
+    // Initial Stack: [newVotes, oldVotes, numCheckpoints, delegatee]
+
+    // Load block number
+    number SAFE_32()                                                        // [blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+
+
+    // Check if any checkpoints exist
+    dup4 iszero                                                            // [numCheckpoints == 0, blockNumber, newVotes, oldVotes, numCheckpoints, delegatee] 
+    no_checkpoints jumpi                                                    // [blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+
+
+    // Check if checkpoint is from this block
+    dup4 SUB_1()                                                           // [numCheckpoints - 1, blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+    dup6 [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                    // [checkpoints[n-1], blockNumber, newvotes, oldVotes, numCheckpoints, delegatee]
+    dup1 _UNPACK_CHECKPOINT_BLOCK()                                         // [checkpoints[n-1].fromBlock, checkpoints[n-1], blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+    dup3 eq                                                                 // [checkpoints[n-1].fromBlock == blockNumber, checkpoints[n-1], blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+    update_votes jumpi
+    pop                                                                     // [blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+    no_checkpoints jump                                                     // 
+
+    // Update existing checkpoint votes in storage
+    update_votes:                                                           // [checkpoints[n-1], blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        dup3 swap1                                                          // [checkpoints[n-1], newVotes, blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        _PACK_CHECKPOINT_VOTES()                                            // [updatedCheckpoint,  blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        dup5 SUB_1()                                                       // [numCheckpoints-1, updatedCheckpoints, blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        dup7                                                                // [delegatee, numCheckpoints-1, updatedCheckpoints, blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        [CHECKPOINTS_SLOT] STORE_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                              // [blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        pop swap2 pop                                                       // [oldVotes, newVotes, delegatee]
+        finish jump
+
+    // Save new checkpoint to storage
+    no_checkpoints:                                                         // [blockNumber, newVotes, oldVotes, numCheckpoints, delegatee]
+        dup2 _PACK_CHECKPOINT()                                             // [newCheckpoint, newVotes, oldVotes, numCheckpoints, delegatee]
+        dup4 dup6                                                           // [delegatee, numCheckpoints, newCheckpoint, newVotes, oldVotes, numCheckpoints, delegatee]
+        [CHECKPOINTS_SLOT] STORE_ELEMENT_FROM_SLOT_AND_KEYS(0x00)           // [newVotes, oldVotes, numCheckpoints, delegatee]
+        swap2 0x01 add                                                      // [numCheckpoints+1, oldVotes, newVotes, delegatee]
+        dup4                                                                // [delegatee, numCheckpoints+1, oldVotes, newVotes, delegatee]
+        [NUM_CHECKPOINT_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                 // [oldVotes, newVotes, delegatee,]
+
+
+    finish:
+        EMIT_DELEGATE_VOTES_CHANGED()                                       // []
+
+}
+
+#define macro _GET_VOTES_OR_0() = takes(1) returns (2) {
+    // InputStack: [src]           // Output: [votes, numCheckpoints, src]
+    dup1 [NUM_CHECKPOINT_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                    // [nCheckPoint[src], src]
+    dup1 iszero return_zero jumpi
+
+    // numCheckpoints - 1
+    dup1 SUB_1()                                                               // [numCheckpoints - 1, numCheckpoints, src]
+    dup3 [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                        // [checkpoints[src], nCheckPoint[src], src]
+    _UNPACK_CHECKPOINT_VOTES()                                                  // [votes[src], nCheckPoint[src], src]
+    finish jump
+
+    return_zero:     // [numCheckpoints[src], src]
+    0x00                                                                        // [0x00, nCheckpoint[src], src]
+
+    finish:
+}
+
+// Initial Stack: [src, dst, amount]
+#define macro _MOVE_DELEGATES() = takes(3) returns (0) {
+    // src != dst
+    dup2 dup2 eq skip jumpi                                                      // [src, dst, amount]
+    // amount != 0
+    dup3 iszero skip jumpi                                                       // [src, dst, amount]
+
+    // src != 0
+    dup1 iszero update_dst jumpi                                                      // [src, dst, amount]
+
+    // Update src delegates
+    _GET_VOTES_OR_0()                                                        // [votes[src], nCheckpoints[src], src, dst, amount]
+
+    // Make sure amount won't underflow votes
+    dup5 dup2 lt vote_underflow jumpi // require (votes[src] > amount)          // [votes[src], nCheckpoints[src], src, dst, amount]
+    dup5 dup2 sub SAFE_96()                                                     // [votes[src] - amount, votes[src], nCheckPoint[src], src, dst, amount]
+    // Save new checkpoint for src
+
+    _WRITE_CHECKPOINT()                                                         // [dst, amount]
+    dup1                                                                        // [dst, dst, amount]
+    update_dst jump
+
+    update_dst:                                                                 // [src, dst, amount]
+        pop           
+        // Skip if dst == 0
+        dup1 iszero skip_dst jumpi                                                      // [dst, amount]
+
+        // Update dst delegates
+        _GET_VOTES_OR_0()                                                              // [votes, ncheckpoint, dst, amount]
+        dup1 dup5 add                                                                  // [votes + amount, votes, nCheckpoint, dst, amount]
+
+        // Check uint96 overflow
+        SAFE_96()                                                                       // [newVotes, oldVotes, numCheckpoints, dst]
+        _WRITE_CHECKPOINT()                                                         // []
+        // 0x00 0x00 return
+        finish jump
+
+    vote_underflow:
+        // __ERROR(VoteUnderflow)
+        0x9c3ab9a3
+        REVERT()
+
+    vote_overflow:
+        // __ERROR(VoteOverflow)
+        0xffc2108e
+        REVERT()
+
+    skip:
+        pop pop pop
+
+    skip_dst:
+        pop pop
+
+    finish:
+
+
+}
+
+#define macro _DELEGATE() = takes(0) returns(0) {
+    // InputStack: [delegator, newDelegate]
+    dup1 [DELEGATES_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                              // [currentDelegate, delegator, newDelegate]
+    dup2 [BALANCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                                // [currentBalance, currentDelegate, delegator, newDelegate]
+
+    // // Store new delegate
+    dup4 dup4                                                                       // [delegator, newDelegate currentBalance, currentDelegate, delegator, newDelegate]
+    [DELEGATES_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                                  // [currentBalance, currentDelegate, delegator, newDelegate]
+
+    // dup2 dup2 _MOVE_DELEGATES()                                                     // [currentDelegate, delegator, newDelegate]
+    // swap1 EMIT_DELEGATE_CHANGED()
+
+    swap2 dup2 dup5 swap2                                                           // [delegator, currentDelegate, newDelegate, currentDelegator, currentBalance, newDelegate]
+    EMIT_DELEGATE_CHANGED()                                                         // [currentDelegate, currentBalance, newDelegate]
+    swap2 dup3                                                                      // [currentDelegate, newDelegate, currentBalance, newDelegate]
+    _MOVE_DELEGATES()                                                               // [newDelegate]
+}
+
+#define macro _ONLY_VALID_RECIPIENT() = takes(0) returns(0) {
+    iszero iszero continue jumpi
+    // __ERROR(SentToZeroAddress)
+        0xec5cac08
+        REVERT()
+
+    continue:
+        
+}
+
+#define macro _TRANSFER_TOKENS() = takes(3) returns(0) {
+    // InputStack: [value, from, to]
+    dup3 _ONLY_VALID_RECIPIENT()
+   // Update the balances of the sender and recipient.
+    _TRANSFER_TAKE_FROM()                                                       // [value, from, to]
+    _TRANSFER_GIVE_TO()                                                         // [value, from, to]
+    dup3 dup3 dup3 EMIT_TRANSFER()                                              // [value, from, to]
+    swap2 [DELEGATES_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                         // [toDelegates, from, value] 
+    swap1 [DELEGATES_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                         // [fromDelegates, toDelegates, value]
+    _MOVE_DELEGATES()                                                           // []
+
+}
+
+#define macro DELEGATE_BY_SIG() = takes(0) returns(1) {
+
+    // /**
+    //  * @notice Delegates votes from signatory to `delegatee`
+    //  * @param delegatee The address to delegate votes to
+    //  * @param nonce The contract state required to match the signature
+    //  * @param expiry The time at which to expire the signature
+    //  * @param v The recovery byte of the signature
+    //  * @param r Half of the ECDSA signature pair
+    //  * @param s Half of the ECDSA signature pair
+    //  */
+    // function delegateBySig(address delegatee, uint nonce, uint expiry, uint8 v, bytes32 r, bytes32 s) public {
+    //     bytes32 domainSeparator = keccak256(abi.encode(DOMAIN_TYPEHASH, keccak256(bytes(name)), getChainId(), address(this)));
+    //     bytes32 structHash = keccak256(abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry));
+    //     bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    //     address signatory = ecrecover(digest, v, r, s);
+    //     require(signatory != address(0), "Comp::delegateBySig: invalid signature");
+    //     require(nonce == nonces[signatory]++, "Comp::delegateBySig: invalid nonce");
+    //     require(block.timestamp <= expiry, "Comp::delegateBySig: signature expired");
+    //     return _delegate(signatory, delegatee);
+    // }
+}
+
+/*
+* @notice Gets the current votes balance for `account`
+* @param account The address to get votes balance
+* @return The number of current votes for `account`
+*/
+#define macro GET_CURRENT_VOTES() = takes(0) returns(1) {
+    0x04 calldataload MASK_ADDRESS()                                   // [account]
+    //     uint32 nCheckpoints = numCheckpoints[account];
+    dup1 [NUM_CHECKPOINT_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)             // [numCheckpoints, account]
+
+    //     return nCheckpoints > 0 ? checkpoints[account][nCheckpoints - 1].votes : 0;
+    dup1 iszero no_checkpoints jumpi
+    SUB_1()                                                             // [numCheckpoints -1, account]
+    swap1 [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)      // [checkpointData]
+    _UNPACK_CHECKPOINT_VOTES()                                          // [numVotes]
+    _RETURN_SINGLE()
+
+
+    no_checkpoints:                                 // [numCheckpoints, account]
+    swap1 pop                                       // [numCheckpoints]
+    _RETURN_SINGLE()
+
+}
+
+/*
+* @notice Determine the prior number of votes for an account as of a block number
+* @dev Block number must be a finalized block or else this function will revert to prevent misinformation.
+* @param account The address of the account to check
+* @param blockNumber The block number to get the vote balance at
+* @return The number of votes the account had as of the given block
+*/
+#define macro GET_PRIOR_VOTES() = takes(0) returns(1) {
+
+    0x04 calldataload MASK_ADDRESS()                            //[account]
+    0x24 calldataload SAFE_32()                                 // [blocknumber, account]
+    number SAFE_32()                                            // [block.number, blocknumber account]
+    //     require(blockNumber < block.number, "Comp::getPriorVotes: not yet determined");
+    dup2 lt iszero not_mined_yet jumpi                           // [blocknumber, account]
+
+    //     uint32 nCheckpoints = numCheckpoints[account];
+    dup2 [NUM_CHECKPOINT_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)         // [numcheckpoints, blocknumber, account]
+
+    //     if (nCheckpoints == 0) { return 0; }
+    dup1 iszero return_zero jumpi                               // [numcheckpoints, blocknumber, account]
+
+    //     if (checkpoints[account][nCheckpoints - 1].fromBlock <= blockNumber) {
+    SUB_1()                                                     // [numcheckpoints-1, blocknum, account]
+    dup1 dup4                                                   // [account, numcheck-1, numcheck-1, blocknum, account]
+    [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)        // [packedCheckpoint, numcheck-1, blocknum, account]
+    dup1 _UNPACK_CHECKPOINT_BLOCK()                             // [checkpoint.block, packedCheckpoint, numcheck-1, blocknum, account]
+    dup4 swap1                                                   // [checkpoint.block, blocknum, checkpoint.block, packedcheck, numcheck-1, blocknum, account]
+    gt check_zero_balance jumpi                                 // [packedcheck, numcheck-1, blocknum, account]
+    //         return checkpoints[account][nCheckpoints - 1].votes;
+    return_votes jump
+    //     }
+
+    //     // Next check implicit zero balance
+    //     if (checkpoints[account][0].fromBlock > blockNumber) { return 0; }
+    check_zero_balance:                                        // [packedcheck, numcheck-1, blocknum, account]
+        pop 0x00                                                   // [0x0, numcheck-1, blocknum, account]
+        dup4 [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)  // [packedcheck, numcheck-1, blocknum, account]
+        _UNPACK_CHECKPOINT_BLOCK() dup3 swap1                      // [checkpoint.block, blocknum, numcheck-1, blocknum, account]
+        gt return_zero jumpi                                       // [numcheck-1, blocknum, account]
+
+    //     uint32 lower = 0;
+    //     uint32 upper = nCheckpoints - 1;
+    0x00 dup2                                                  // [upper, lower, numcheck-1, blocknum, account]
+
+    check_if_upper_is_greater:
+        dup2 dup2 gt while_upper_is_greater jumpi                  // [upper, lower, numcheck-1, blocknum, account]
+        pop dup4                                                   // [account, lower, numcheck-1, blocknum]
+        [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)       // [packedcheck, numcheck-1, blocknum]
+        //     return checkpoints[account][lower].votes;
+        return_votes jump
+
+    // while (upper > lower) {
+    while_upper_is_greater:                                    // [upper, lower, numcheck-1, blocknum, account]
+        //         uint32 center = upper - (upper - lower) / 2; // ceil, avoiding overflow
+        dup2 dup2 sub                                              // [upper-lower, upper, lower, numcheck-1, blocknum, account]
+        0x02 swap1 div                                             // [upper-lower/2, upper, lower, numcheck-1, blocknum, account]
+        dup2 sub                                                   // [center, upper, lower, numcheck-1, blocknum, account]
+
+        //         Checkpoint memory cp = checkpoints[account][center];
+        dup1 dup7                                                  // [account, center, center, upper, lower, numcheck-1, blocknum, account]
+        [CHECKPOINTS_SLOT] LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)       // [checkpoint, center, upper, lower, numcheck-1, blocknum, account]
+        dup1 _UNPACK_CHECKPOINT_BLOCK()                            // [checkpoint.block, checkpoint, center, upper, lower, numcheck-1, blocknum, account]
+        //         if (cp.fromBlock == blockNumber) {
+        //             return cp.votes;
+        dup7 eq return_votes jumpi                                 // [checkpoint, center, upper, lower, numcheck-1, blocknum, account]
+        //         } else if (cp.fromBlock < blockNumber) {
+        _UNPACK_CHECKPOINT_BLOCK()                                 // [checkpoint.block, center, upper, lower, numcheck-1, blocknum, account]
+        dup6                                                       // [blocknum, checkpoint.block, center, upper, lower, numcheck-1, blocknum, account]
+        gt lower_is_center jumpi                                   // [center, upper, lower, numcheck-1, blocknum, account]
+        //             upper = center - 1;
+        SUB_1() swap1                                              // [upper, center-1, lower, numcheck-1, blocknum, account]
+        pop check_if_upper_is_greater jump
+
+        //             lower = center;
+    lower_is_center:                                           // [center, upper, lower, numcheck-1, blocknum, account]
+        swap2 pop                                                  // [upper, center, numcheck-1, blocknum, account]
+        check_if_upper_is_greater jump
+    // }
+
+    return_votes:          // [packedCheckpoint]
+        _UNPACK_CHECKPOINT_VOTES()                              // [votes, numcheck-1, blocknum, account]
+        _RETURN_SINGLE()
+
+    return_zero:
+        0x00 
+        _RETURN_SINGLE()
+
+    not_mined_yet:
+        0x95e87bea         // BlockDoesntExist()
+        REVERT()
+}
+
+#define macro DELEGATE() = takes(0) returns(0) {
+    0x04 calldataload MASK_ADDRESS()                                            // [delegatee]
+    caller                                                                      // [delegator, delegatee]
+    _DELEGATE()
+}
+
+#define macro NONCES() = takes (0) returns (0) {
+    0x04 calldataload MASK_ADDRESS()                                       // [account]
+    [NONCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                              // [nonce]
+    0x00 mstore                                                                // []
+    0x20 0x00 return                                                           // []
+}
+
+
+#define macro _NAME() = takes(0) returns (1) {
+    0x05546f6b656e 
+}
+
+/* EIP-2612 */
+#define macro COMPUTE_DOMAIN_SEPARATOR() = takes (0) returns (1) {
+    [PERMIT_TYPEHASH]                                                          // [DOMAIN_SEPARATOR_3
+    0x00 mstore                                                                // []
+    _NAME() 0x20 mstore                                                    // []
+    0x20 0x20 sha3                                                             // [name hash]
+    0x20 mstore                                                                // []
+    0x31                                                                       // ["1"] 0x31 is hex for ascii for 1
+    0x40 mstore                                                                // []
+    0x02 0x40 sha3                                                             // [hash of "1"]
+    0x20 0x40 mstore                                                           // []
+    chainid                                                                    // [chainid]
+    0x60 mstore                                                                // []
+    address                                                                    // [address(this)]
+    0x80 mstore                                                                // []
+    0xA0 0x00                                                                  // [loc, len]
+    sha3                                                                       // [hash]
+}
+
+#define macro _DOMAIN_SEPARATOR() = takes (0) returns (1) {
+    chainid                                                                    // [chainid]
+    [INITIAL_CHAIN_ID] sload                                                   // [INITIAL_CHAIN_ID, chainid]
+    eq                                                                         // [INITIAL_CHAIN_ID == chainid]
+    useInitial jumpi                                                           // []
+    COMPUTE_DOMAIN_SEPARATOR()                                                 // [computed domain separator]
+    done jump
+
+    useInitial:
+    [INITIAL_DOMAIN_SEPARATOR] sload                                           // [INITIAL_DOMAIN_SEPARATOR]
+
+    done:
+}
+
+// Stores updated nonce in storage and leaves current nonce on stack
+#define macro _NONCE_PLUS_PLUS() = takes (1) returns (1) {
+    // starting stack                                                          // [account]
+    dup1                                                                       // [account, account]
+    [NONCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                              // [currentNonce, account]
+    dup1                                                                       // [currentNonce, currentNonce, account]
+    0x01                                                                       // [1, currentNonce, currentNonce, account]
+    add                                                                        // [nextNonce, currentNonce, account]
+    dup3                                                                       // [account, nextNonce, currentNonce, account]
+    [NONCE_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                             // [currentNonce, account]
+    swap1 // clean up stack                                                    // [account, currentNonce]
+    pop   // clean up stack                                                    // [currentNonce]
+}
+
+#define macro DOMAIN_SEPARATOR() = takes (0) returns (0) {
+    _DOMAIN_SEPARATOR()
+    0x00 mstore                                                                // [domain separator]
+    0x20 0x00 return                                                           // []
+}
+
+#define macro PERMIT() = takes (0) returns (0) {
+    // permit() fn sig for reference:
+    //     address owner, //       0x04
+    //     address spender, //     0x24
+    //     uint256 value, //       0x44
+    //     uint256 deadline, //    0x64
+    //     uint8 v, //             0x84
+    //     bytes32 r, //           0xa4
+    //     bytes32 s)//            0xc4
+
+    // check deadline
+    0x64 calldataload                                                          // [deadline]
+    dup1                                                                       // [deadline, deadline]
+    timestamp                                                                  // [timestamp, deadline, deadline]
+    gt                                                                         // [timestamp > deadline, deadline]
+    expired jumpi                                                              // [deadline]
+
+    // calc inner kec
+    0x04 calldataload                                                          // [owner, deadline]
+    _NONCE_PLUS_PLUS()                                                         // [nonce, deadline]
+    0x44 calldataload                                                          // [value, nonce, deadline]
+    0x24 calldataload                                                          // [spender, value, nonce, deadline]
+    0x04 calldataload                                                          // [owner, spender, value, nonce, deadline]
+    [PERMIT_TYPEHASH]                                                          // [permit hash, owner, spender, value, nonce, deadline]
+    0x00 mstore                                                                // [owner, spender, value, nonce, deadline]
+    0x20 mstore                                                                // [spender, value, nonce, deadline]
+    0x40 mstore                                                                // [value, nonce, deadline]
+    0x60 mstore                                                                // [nonce, deadline]
+    0x80 mstore                                                                // [deadline]
+    0xa0 mstore                                                                // []
+    0xc0 0x00                                                                  // [loc, len]
+    sha3                                                                       // [inner hash]
+
+    // calc and mstore outer kec
+    _DOMAIN_SEPARATOR()                                                        // [DOMAIN_SEPARATOR, inner hash]
+    [X_1901]                                                                   // [0x1901, DOMAIN_SEPARATOR, inner hash]
+    0x00 mstore                                                                // [DOMAIN_SEPARATOR, inner hash]
+    0x02 mstore  // note: abi.encodePacked                                     // [inner hash]
+    0x22 mstore                                                                // []
+    0x42 0x00                                                                  // [loc, len]
+    sha3                                                                       // [outer hash]
+                                                                               //                   memory layout:
+    0x00 mstore                                                                // []                0x00 outer hash
+    0x84 calldataload                                                          // [v]
+    0x20 mstore                                                                // []                0x00 outerhash 0x20 v
+    0xa4 calldataload                                                          // [r]
+    0x40 mstore                                                                // []                0x00 outerhash 0x20 v 0x40 r
+    0xc4 calldataload                                                          // [s]
+    0x60 mstore                                                                // []                0x00 outerhash 0x20 v 0x40 r 0x60 s
+
+    // prepare stack for later
+    0x44 calldataload                                                          // [value]
+    0x24 calldataload MASK_ADDRESS()                                           // [spender, value]
+
+    // ecrecover
+    0x20                                                                       // [32, spender, value]
+    0x80                                                                       // [128, 32, spender, value]
+    0x80                                                                       // [128, 128, 32, spender, value]
+    0x00                                                                       // [0, 128, 128, 32, spender, value]
+    0x1                                                                        // [ecrecover precompile address, 0, 128, 128, 32, spender, value]
+    0xFFFFFFFF                                                                 // [gas, ecrecover precompile address, 0, 128, 128, 32, spender, value]
+    staticcall                                                                 // [success, spender, value]
+    pop // TODO: check for success                                             // [spender, value]
+    0x80 mload                                                                 // [recovered address, spender, value]
+
+    // check for recovered 0 address
+    dup1                                                                       // [recovered address, recovered address, spender, value]
+    0x00 eq                                                                    // [recovered address == 0, recovered address, spender, value]
+    invalidSigner jumpi                                                        // [recovered address, spender, value]
+
+    // check for address is owner
+    dup1                                                                       // [recovered address, recovered address, spender, value]
+    0x04 calldataload MASK_ADDRESS()                                           // [owner, recovered address, recovered address, spender, value]
+    eq                                                                         // [owner == recovered address, recovered address, spender, value]
+    iszero                                                                     // [owner != recovered address, recovered address, spender, value]
+    invalidSigner jumpi                                                        // [recovered address, spender, value]
+    [APPROVAL_SLOT]                                                            // [slot, recovered address, spender, value]
+    STORE_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                                     // []
+
+    // Emit the Approval event
+    0x44 calldataload                                                          // [value]
+    0x24 calldataload                                                          // [to, value]
+    0x04 calldataload                                                          // [from, to, value]
+    EMIT_APPROVAL()
+
+    0x00 0x00 return
+
+    expired:
+    // __ERROR(PermitExpired)
+    0x1a15a3cc
+    REVERT()
+
+    invalidSigner: 
+    // __ERROR(InvalidSigner)
+    0x815e1d64
+    REVERT()
+}
+
+
+/* Metadata */
+#define macro NAME() = takes (0) returns (0) {
+    0x20 0x00 mstore
+    _NAME() 0x25 mstore
+    0x60 0x00 return
+}
+
+#define macro SYMBOL() = takes (0) returns (0) {
+    0x20 0x00 mstore
+    0x03544B4E 0x23 mstore
+    0x60 0x00 return
+}
+
+#define macro DECIMALS() = takes (0) returns (0) {
+    0x12 0x00 mstore
+    0x20 0x00 return
+}
+
+/* Accounting Functions */
+#define macro BALANCE_OF() = takes (0) returns (0) {
+    0x04 calldataload                                                          // [account]
+    [BALANCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                                // [balance]
+    0x00 mstore                                                                // []
+    0x20 0x00 return                                                           // []
+}
+
+#define macro _TOTAL_SUPPLY() = takes(0) returns(0) {
+    0xd3c21bcecceda1000000 
+}
+
+#define macro TOTAL_SUPPLY() = takes (0) returns (0) {
+    _TOTAL_SUPPLY()
+    0x00 mstore                                                                // []
+    0x20 0x00 return                                                           // []
+}
+
+/* Approval Functions */
+#define macro ALLOWANCE() = takes (0) returns (0) {
+    0x24 calldataload                                                          // [to]
+    0x04 calldataload                                                          // [from, to]
+    [APPROVAL_SLOT]                                                            // [slot, from, to]
+    LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                                      // [allowance]
+    0x00 mstore                                                                // []
+    0x20 0x00 return
+}
+
+#define macro APPROVE() = takes (0) returns (0) {
+    0x24 calldataload                                                          // [value]
+    // Check max approval == uint256.max
+    dup1 [UINT_256_MAX] eq max_approval jumpi                                  // [value]
+    dup1 SAFE_96()                                                             // [value]
+
+    // Finish approval
+    set_approval jump
+
+    // Set approval to uint96.max
+    max_approval:
+        [UINT_96_MAX]
+
+    // Set Approval
+    set_approval:
+    0x04 calldataload MASK_ADDRESS()                                           // [to, value]
+    caller                                                                     // [from, to, value]
+    [APPROVAL_SLOT]                                                            // [slot, from, to, value]
+    STORE_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                                     // []
+
+    // Emit the Approval event
+    0x24 calldataload                                                          // [value]
+    0x00 mstore                                                                // []
+    0x04 calldataload                                                          // [to]
+    caller                                                                     // [from, to]
+    __EVENT_HASH(Approval)                                                 // [sig, from, to]
+    0x20 0x00                                                                  // [0, 32, sig, from, to]
+    log3                                                                       // []
+
+    0x01 0x00 mstore  // return 01 for true
+    0x20 0x00 return
+}
+
+/* Transfer Functions */
+#define macro TRANSFER() = takes(0) returns(1) {
+    // Setup the stack for the transfer function.
+    0x04 calldataload MASK_ADDRESS()                                           // [to]
+    caller                                                                     // [from, to]
+    0x24 calldataload SAFE_96()                                                // [value, from, to]
+
+    dup3 dup3 dup3 _TRANSFER_TOKENS()                                          // [value, from, to]
+
+
+    // Return "1" to represent a succesful transfer.
+    0x01 0x00 mstore
+    0x20 0x00 return
+}
+
+#define macro TRANSFER_FROM() = takes(0) returns(1) {
+    // Setup the stack for the transfer function.
+    0x24 calldataload MASK_ADDRESS()                                           // [to]
+    0x04 calldataload MASK_ADDRESS()                                           // [from, to]
+    caller                                                                     // [msg.sender, from, to]
+
+    // Load allowance
+    dup2                                                                       // [from, msg.sender, from, to]
+    [APPROVAL_SLOT]                                                            // [slot, from, msg.sender, from, to]
+    LOAD_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                                      // [allowance, from, to]
+    dup1                                                                       // [allowance, allowance, from, to]
+    0x44 calldataload SAFE_96()                                                // [value, allowance, allowance, from, to]
+
+    // check isOwner
+    dup4                                                                       // [from, value, allowance, allowance, from, to]
+    caller                                                                     // [msg.sender, from, value, allowance, allowance, from, to]
+    eq                                                                         // [msg.sender == from, value, allowance, allowance, from, to]
+    approved1 jumpi                                                            // [value, allowance, allowance, from, to]
+
+    // check max approval
+    dup2                                                                       // [allowance, value, allowance, allowance, from, to]
+    [UINT_96_MAX]                                                             // [type(uint).max, allowance, value, allowance, allowance, from, to]
+    eq                                                                         // [type(uint).max == allowance, value, allowance, allowance, from, to]
+    approved1 jumpi                                                            // [value, approved, approved, from, to]
+
+    // check has approval
+    gt                                                                         // [value > approved, approved, from, to]
+    insufficientApproval jumpi                                                 // [approved, from, to]
+
+    // adjust approval
+    0x44 calldataload                                                          // [value, approved, from, to]
+    swap1                                                                      // [approved, value, from, to]
+    sub                                                                        // [approved - value => newApprovalValue, from, to]
+    caller                                                                     // [msg.sender, newApprovalValue, from, to]
+    dup3                                                                       // [from, msg.sender, newApprovalValue, from, to]
+    [APPROVAL_SLOT]                                                            // [slot, from, msg.sender, newApprovalValue, from, to]
+    STORE_ELEMENT_FROM_SLOT_AND_KEYS(0x00)                                     // [from, to]
+    approved2 jump                                                             // [from, to]
+
+    approved1:                                                                 // [value, approved, approved, from, to]
+    pop pop pop                                                                // [from, to]
+
+    approved2:                                                                 // [from, to]
+    0x44 calldataload                                                          // [value, from, to]
+
+    dup3 dup3 dup3 _TRANSFER_TOKENS()
+
+    // Return "1" to represent a succesful transfer.
+    0x01 0x00 mstore
+    0x20 0x00 return
+
+    insufficientApproval:
+        // __ERROR(InsufficientAllowance)
+        0x13be252b
+        REVERT()
+}
+
+#define macro _TRANSFER_TAKE_FROM() = takes(3) returns (3) {
+    // input stack: [value, from, to]
+    dup2 [BALANCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                       // [balance, value, from, to]                                                // [from, value, from, to]
+    dup1                                                                       // [balance, balance, value, from, to]
+    dup3                                                                       // [value, balance, balance, value, from, to]
+    gt                                                                         // [value>balance, balance, value, from, to]
+    iszero                                                                     // [value<=balance, balance, value, from, to]
+    valid jumpi                                                                // [balance, value, from, to]
+
+    // insufficient funds
+    // __ERROR(InsufficientFunds)
+    0x356680b7
+    REVERT()
+
+    // Update the sender's balance.
+    valid:
+    dup2                                                                       // [value, balance, value, from, to]
+    swap1                                                                      // [balance, value, value, from, to]
+    sub                                                                        // [balance - value, value, from, to]
+    dup3                                                                       // [from, balance-value, value, from, to]
+    [BALANCE_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                           // [value, from, to]
+}
+
+#define macro _TRANSFER_GIVE_TO() = takes(3) returns (0) {
+    // input stack: [value, from, to]
+    dup3                                                                       // [to, value, from, to]
+    dup2                                                                       // [value, to, value, from, to]
+    swap1                                                                      // [to, value, value, from, to]
+    [BALANCE_SLOT] LOAD_ELEMENT_FROM_KEYS(0x00)                            // [balance, value, value, from, to]
+    add                                                                        // [balance+value, value, from, to]
+    SAFE_96()
+    dup4                                                                       // [to, balance+value, value, from, to]
+    [BALANCE_SLOT] STORE_ELEMENT_FROM_KEYS(0x00)                           // [value, from, to]
+}
+
+/* Utility Functions */
+#define macro NON_PAYABLE() = takes(0) returns (0) {
+    callvalue iszero                                                           // [msg.value == 0]
+    novalue jumpi                                                              // []
+
+    0x1574f9f3
+    REVERT()
+    novalue:
+}
+
+// Main Macro
+#define macro MAIN() = takes(0) returns (0) {
+    NON_PAYABLE()
+
+    // Identify which function is being called.
+    0x00 calldataload 0xE0 shr                                                 // [fn sig]
+    dup1 __FUNC_SIG(transfer)           eq transferJump         jumpi
+    dup1 __FUNC_SIG(transferFrom)       eq transferFromJump     jumpi
+    dup1 __FUNC_SIG(balanceOf)          eq balanceOfJump        jumpi
+    dup1 __FUNC_SIG(totalSupply)        eq totalSupplyJump      jumpi
+    dup1 __FUNC_SIG(approve)            eq approveJump          jumpi
+    dup1 __FUNC_SIG(delegate)           eq delegateJump         jumpi
+    dup1 __FUNC_SIG(delegates)          eq delegatesJump        jumpi
+    dup1 __FUNC_SIG(allowance)          eq allowanceJump        jumpi
+    dup1 __FUNC_SIG(permit)             eq permitJump           jumpi
+    dup1 __FUNC_SIG(checkpoints)        eq checkpointsJump      jumpi
+    dup1 __FUNC_SIG(checkpointVotes)    eq checkpointVotesJump  jumpi
+    dup1 __FUNC_SIG(checkpointBlock)    eq checkpointBlockJump  jumpi
+    dup1 __FUNC_SIG(numCheckpoints)     eq numCheckpointsJump   jumpi
+    dup1 __FUNC_SIG(getCurrentVotes)    eq getCurrentVotesJump  jumpi
+    dup1 __FUNC_SIG(getPriorVotes)      eq getPriorVotesJump    jumpi
+    dup1 __FUNC_SIG(nonces)             eq noncesJump           jumpi
+    dup1 __FUNC_SIG(decimals)           eq decimalsJump         jumpi
+    dup1 __FUNC_SIG(name)               eq nameJump             jumpi
+    dup1 __FUNC_SIG(symbol)             eq symbolJump           jumpi
+    dup1 __FUNC_SIG(DOMAIN_SEPARATOR)   eq domainSeparatorJump  jumpi
+
+    0x00 0x00 revert
+
+    checkpointBlockJump:
+    CHECKPOINT_BLOCK()
+
+    checkpointVotesJump:
+    CHECKPOINT_VOTES()
+
+    delegatesJump:
+    DELEGATES()
+
+    delegateJump:
+    DELEGATE()
+
+    checkpointsJump:
+    CHECKPOINTS()
+
+    numCheckpointsJump:
+    NUM_CHECKPOINTS()
+
+    getCurrentVotesJump:
+    GET_CURRENT_VOTES()
+
+    getPriorVotesJump:
+    GET_PRIOR_VOTES()
+
+    allowanceJump:
+    ALLOWANCE()
+
+    approveJump:
+    APPROVE()
+
+    balanceOfJump:
+    BALANCE_OF()
+
+    decimalsJump:
+    DECIMALS()
+
+    domainSeparatorJump:
+    DOMAIN_SEPARATOR()
+
+    nameJump:
+    NAME()
+
+    noncesJump:
+    NONCES()
+
+    permitJump:
+    PERMIT()
+
+    symbolJump:
+    SYMBOL()
+
+    totalSupplyJump:
+    TOTAL_SUPPLY()
+
+    transferFromJump:
+    TRANSFER_FROM()
+
+    transferJump:
+    TRANSFER()
+
+}
